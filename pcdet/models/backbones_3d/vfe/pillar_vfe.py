@@ -19,7 +19,12 @@ class PFNLayer(nn.Module):
             out_channels = out_channels // 2
 
         if self.use_norm:
+            # 根据论文中，这是是简化版pointnet网络层的初始化
+            # 论文中使用的是 1x1 的卷积层完成这里的升维操作（理论上使用卷积的计算速度会更快）
+            # 输入的通道数是刚刚经过数据增强过后的点云特征，每个点云有10个特征，
+            # 输出的通道数是64
             self.linear = nn.Linear(in_channels, out_channels, bias=False)
+            # 一维BN层
             self.norm = nn.BatchNorm1d(out_channels, eps=1e-3, momentum=0.01)
         else:
             self.linear = nn.Linear(in_channels, out_channels, bias=True)
@@ -34,14 +39,21 @@ class PFNLayer(nn.Module):
                                for num_part in range(num_parts+1)]
             x = torch.cat(part_linear_out, dim=0)
         else:
+            # x的维度由（M, 32, 10）升维成了（M, 32, 64）
             x = self.linear(inputs)
         torch.backends.cudnn.enabled = False
+        # BatchNorm1d层:(M, 64, 32) --> (M, 32, 64)
+        # （pillars,num_point,channel）->(pillars,channel,num_points)
+        # 这里之所以变换维度，是因为BatchNorm1d在通道维度上进行,对于图像来说默认模式为[N,C,H*W],通道在第二个维度上
         x = self.norm(x.permute(0, 2, 1)).permute(0, 2, 1) if self.use_norm else x
         torch.backends.cudnn.enabled = True
         x = F.relu(x)
+        # 完成pointnet的最大池化操作，找出每个pillar中最能代表该pillar的点
+        # x_max shape ：（M, 1, 64）
         x_max = torch.max(x, dim=1, keepdim=True)[0]
 
         if self.last_vfe:
+            # 返回经过简化版pointnet处理pillar的结果
             return x_max
         else:
             x_repeat = x_max.repeat(1, inputs.shape[1], 1)
@@ -50,6 +62,16 @@ class PFNLayer(nn.Module):
 
 
 class PillarVFE(VFETemplate):
+    """
+    model_cfg:NAME: PillarVFE
+                    WITH_DISTANCE: False
+                    USE_ABSLOTE_XYZ: True
+                    USE_NORM: True
+                    NUM_FILTERS: [64]
+    num_point_features:4
+    voxel_size:[0.16 0.16 4]
+    POINT_CLOUD_RANGE: [0, -39.68, -3, 69.12, 39.68, 1]
+    """
     def __init__(self, model_cfg, num_point_features, voxel_size, point_cloud_range, **kwargs):
         super().__init__(model_cfg=model_cfg)
 
@@ -71,6 +93,7 @@ class PillarVFE(VFETemplate):
             pfn_layers.append(
                 PFNLayer(in_filters, out_filters, self.use_norm, last_layer=(i >= len(num_filters) - 2))
             )
+        # 加入线性层，将10维特征变为64维特征
         self.pfn_layers = nn.ModuleList(pfn_layers)
 
         self.voxel_x = voxel_size[0]
@@ -84,17 +107,44 @@ class PillarVFE(VFETemplate):
         return self.num_filters[-1]
 
     def get_paddings_indicator(self, actual_num, max_num, axis=0):
+        """
+        计算padding的指示
+        Args:
+            actual_num:每个voxel实际点的数量(M,)
+            max_num:voxel最大点的数量(32,)
+        Returns:
+            paddings_indicator:表明一个pillar中哪些是真实数据,哪些是填充的0数据
+        """
+        # 扩展一个维度，使变为（M，1）
         actual_num = torch.unsqueeze(actual_num, axis + 1)
+        # [1, 1]
         max_num_shape = [1] * len(actual_num.shape)
+        # [1, -1]
         max_num_shape[axis + 1] = -1
+        # (1,32)
         max_num = torch.arange(max_num, dtype=torch.int, device=actual_num.device).view(max_num_shape)
+        # (M, 32)
         paddings_indicator = actual_num.int() > max_num
         return paddings_indicator
 
     def forward(self, batch_dict, **kwargs):
-  
+        """
+        batch_dict:
+            points:(N,5) --> (batch_index,x,y,z,r) batch_index代表了该点云数据在当前batch中的index
+            frame_id:(4,) --> (003877,001908,006616,005355) 帧ID
+            gt_boxes:(4,40,8)--> (x,y,z,dx,dy,dz,ry,class)
+            use_lead_xyz:(4,) --> (1,1,1,1)
+            voxels:(M,32,4) --> (x,y,z,r)
+            voxel_coords:(M,4) --> (batch_index,z,y,x) batch_index代表了该点云数据在当前batch中的index
+            voxel_num_points:(M,)
+            image_shape:(4,2) 每份点云数据对应的2号相机图片分辨率
+            batch_size:4    batch_size大小
+        """
         voxel_features, voxel_num_points, coords = batch_dict['voxels'], batch_dict['voxel_num_points'], batch_dict['voxel_coords']
+        # 求每个pillar中所有点云的和 (M, 32, 3)->(M, 1, 3) 设置keepdim=True的，则保留原来的维度信息
+        # 然后在使用求和信息除以每个点云中有多少个点来求每个pillar中所有点云的平均值 points_mean shape：(M, 1, 3)
         points_mean = voxel_features[:, :, :3].sum(dim=1, keepdim=True) / voxel_num_points.type_as(voxel_features).view(-1, 1, 1)
+        # 每个点云数据减去该点对应pillar的平均值得到差值 xc,yc,zc
         f_cluster = voxel_features[:, :, :3] - points_mean
 
         f_center = torch.zeros_like(voxel_features[:, :, :3])
